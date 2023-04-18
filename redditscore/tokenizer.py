@@ -356,12 +356,12 @@ class CrazyTokenizer(object):
         twitter_handle_flag = self._nlp.vocab.add_flag(twitter_handle_check)
 
         self._merging_matcher.add(
-            'HASHTAG', None, [{'ORTH': '#'}, {'IS_ASCII': True}])
+            'HASHTAG', [{'ORTH': '#'}, {'IS_ASCII': True}])
         self._merging_matcher.add(
-            'SUBREDDIT', None,
+            'SUBREDDIT',
             [{'ORTH': '/r'}, {'ORTH': '/'}, {alpha_digits_flag: True}],
             [{'ORTH': 'r'}, {'ORTH': '/'}, {alpha_digits_flag: True}])
-        self._merging_matcher.add('REDDIT_USERNAME', None,
+        self._merging_matcher.add('REDDIT_USERNAME',
                                   [{'ORTH': '/u'}, {'ORTH': '/'},
                                       {alpha_digits_flag: True}],
                                   [{'ORTH': 'u'}, {'ORTH': '/'},
