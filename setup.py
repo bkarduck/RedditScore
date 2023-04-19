@@ -42,7 +42,7 @@ setup(
     long_description=readme,
     author='Evgenii Nikitin',
     author_email='e.nikitin@nyu.edu',
-    url='https://github.com/crazyfrogspb/RedditScore',
+    url='https://github.com/bkarduck/RedditScore',
     license=license,
     packages=find_packages(exclude=('tests', 'docs')),
     include_package_data=True,
