@@ -29,6 +29,8 @@ from urllib import parse
 import requests
 import tldextract
 from bs4 import BeautifulSoup
+import spacy
+from spacy.language import Language
 from eventlet.green.urllib.request import urlopen
 from eventlet.timeout import Timeout
 from redditscore.models.redditmodel import word_ngrams
@@ -43,6 +45,11 @@ except ImportError:
     warnings.warn(
         'nltk could not be imported, some features will be unavailable')
 
+fruit_getter = lambda token: token.text in ("apple", "pear", "banana")
+Token.set_extension("is_fruit", getter=fruit_getter)
+x = English()
+doc = x("I have an apple")
+assert doc[3]._.is_fruit
 
 Token.set_extension('transformed_text', default='', force=True)
 Doc.set_extension('tokens', default='', force=True)
@@ -59,7 +66,9 @@ NORMALIZE_RE = re.compile(r"([a-zA-Z])\1\1+")
 ALPHA_DIGITS_RE = re.compile(r"[a-zA-Z0-9_]+")
 TWITTER_HANDLES_RE = re.compile(r"@\w{1,15}")
 REDDITORS_RE = re.compile(r"u/\w{1,20}")
+REDDITORS_RE2 = re.compile(r"/u/\w{1,20}")
 SUBREDDITS_RE = re.compile(r"/r/\w{1,20}")
+SUBREDDITS_RE2 = re.compile(r"r/\w{1,20}")
 QUOTES_RE = re.compile(r'^".*"$')
 REDDIT_QUOTES_RE = re.compile(r'&gt;[^\n]+\n')
 BREAKS_RE = re.compile(r"[\r\n]+")
@@ -338,11 +347,13 @@ class CrazyTokenizer(object):
                  emails=False, extra_patterns=None, keep_untokenized=None,
                  whitespaces_to_underscores=True, remove_nonunicode=False,
                  pos_emojis=None, neg_emojis=None, neutral_emojis=None,
-                 print_url_warnings=False, latin_chars_fix=False,
+                 print_url_warnings=False, latin_chars_fix=False, drop_nums=False,
                  ngrams=1):
         self.params = locals()
 
         self._nlp = English()
+        #self._nlp = spacy.load('en_core_web_sm')
+
         self._merging_matcher = Matcher(self._nlp.vocab)
         self._matcher = Matcher(self._nlp.vocab)
 
@@ -354,18 +365,18 @@ class CrazyTokenizer(object):
         alpha_digits_flag = self._nlp.vocab.add_flag(alpha_digits_check)
         hashtag_flag = self._nlp.vocab.add_flag(hashtag_check)
         twitter_handle_flag = self._nlp.vocab.add_flag(twitter_handle_check)
-
+        pattern = [{'ORTH': '#'}, {'IS_ASCII': True}]
         self._merging_matcher.add(
-            'HASHTAG', [{'ORTH': '#'}, {'IS_ASCII': True}])
+            'HASHTAG', [pattern])
         self._merging_matcher.add(
-            'SUBREDDIT',
-            [{'ORTH': '/r'}, {'ORTH': '/'}, {alpha_digits_flag: True}],
-            [{'ORTH': 'r'}, {'ORTH': '/'}, {alpha_digits_flag: True}])
-        self._merging_matcher.add('REDDIT_USERNAME',
-                                  [{'ORTH': '/u'}, {'ORTH': '/'},
-                                      {alpha_digits_flag: True}],
+            'SUBREDDIT', 
+            [[{'ORTH': '/r'}, {'ORTH': '/'}, {'IS_ALPHA': True}],
+            [{'ORTH': 'r'}, {'ORTH': '/'}, {'IS_ALPHA': True}]])
+        self._merging_matcher.add('REDDIT_USERNAME', 
+                                  [[{'ORTH': '/u'}, {'ORTH': '/'},
+                                      {'IS_ALPHA': True}],
                                   [{'ORTH': 'u'}, {'ORTH': '/'},
-                                   {alpha_digits_flag: True}])
+                                   {'IS_ALPHA': True}]])
 
         if isinstance(ignore_stopwords, str) and ('nltk' in sys.modules):
             try:
@@ -374,8 +385,8 @@ class CrazyTokenizer(object):
                 raise ValueError(
                     'Language {} was not found by NLTK'.format(ignore_stopwords))
         elif ignore_stopwords is True:
-            self._matcher.add('STOPWORDS', self._remove_token,
-                              [{'IS_STOP': True}])
+            self._matcher.add('STOPWORDS',
+                              [[{'IS_STOP': True}]], on_match=self._remove_token)
         elif isinstance(ignore_stopwords, list):
             self._stopwords = [word.lower() for word in ignore_stopwords]
         elif ignore_stopwords is not False:
@@ -383,79 +394,122 @@ class CrazyTokenizer(object):
                 type(ignore_stopwords)))
 
         if lowercase and (not keepcaps):
-            self._matcher.add('LOWERCASE', self._lowercase,
-                              [{'IS_LOWER': False}])
+            self._matcher.add('LOWERCASE',[[{'IS_LOWER': False}]], on_match=self._lowercase,
+                             )
         elif lowercase and keepcaps:
-            self._matcher.add('LOWERCASE', self._lowercase, [
-                {'IS_LOWER': False, 'IS_UPPER': False}])
+            self._matcher.add('LOWERCASE', [[
+                {'IS_LOWER': False, 'IS_UPPER': False}]], on_match=self._lowercase)
 
         if remove_punct:
-            self._matcher.add('PUNCTUATION', self._remove_token, [
-                {'IS_PUNCT': True}])
+            self._matcher.add('PUNCTUATION',  [[
+                {'IS_PUNCT': True}]], on_match=self._remove_token)
 
         if remove_breaks:
             def break_check(text):
                 return bool(BREAKS_RE.fullmatch(text))
             break_flag = self._nlp.vocab.add_flag(break_check)
-            self._matcher.add('BREAK', self._remove_token, [{break_flag: True}])
+            self._matcher.add('BREAK', [[{'IS_SPACE': True}]], on_match=self._remove_token)
 
         if normalize:
             def normalize_check(text):
                 return bool(NORMALIZE_RE.search(text))
             normalize_flag = self._nlp.vocab.add_flag(normalize_check)
-            self._matcher.add('NORMALIZE', self._normalize,
-                              [{normalize_flag: True}])
+            self._matcher.add('NORMALIZE',
+                              [[{'NORM': str(normalize)}]], on_match=self._normalize)
 
         if numbers is not False:
-            self._matcher.add('NUMBER', self._replace_token,
-                              [{'LIKE_NUM': True}])
+            self._matcher.add('NUMBER', 
+                              [[{'LIKE_NUM': True}], [{'IS_DIGIT':True}]], on_match=self._replace_token)
             self._replacements['NUMBER'] = numbers
 
         if urls is not False:
             if urls in ['domain', 'domain_unwrap_fast',
                         'domain_unwrap', 'title']:
                 self._urls = urls
-                self._matcher.add('URL', self._process_url, [
-                    {'LIKE_URL': True}])
+                self._matcher.add('URL', [[
+                    {'LIKE_URL': True}]], on_match=self._process_url)
             elif isinstance(urls, dict):
                 self._domains = urls
                 self._urls = 'domain_unwrap_fast'
-                self._matcher.add('URL', self._process_url, [
-                    {'LIKE_URL': True}])
+                self._matcher.add('URL',  [[
+                    {'LIKE_URL': True}]], on_match=self._process_url)
             else:
-                self._matcher.add('URL', self._replace_token,
-                                  [{'LIKE_URL': True}])
+                self._matcher.add('URL', 
+                                  [[{'LIKE_URL': True}]], on_match=self._replace_token)
                 self._replacements['URL'] = urls
 
+        if drop_nums is not False:
+            self._matcher.add('NUMBER', 
+                              [[{'IS_DIGIT': True}]], on_match=self._replace_token)
+            self._replacements['NUMBER'] = drop_nums
         if emails is not False:
-            self._matcher.add('EMAIL', self._replace_token,
-                              [{'LIKE_EMAIL': True}])
+            self._matcher.add('EMAIL', 
+                              [[{'LIKE_EMAIL': True}]], on_match=self._replace_token)
             self._replacements['EMAIL'] = emails
-
         if reddit_usernames is not False:
             def reddit_username_check(text):
                 return bool(REDDITORS_RE.fullmatch(text))
+            def reddit_username_check2(text):
+                return bool(REDDITORS_RE2.fullmatch(text))
+           
             reddit_username_flag = self._nlp.vocab.add_flag(
                 reddit_username_check)
-            self._matcher.add('REDDIT_USERNAME', self._replace_token, [
-                {reddit_username_flag: True}])
+            reddit_username_flag2 = self._nlp.vocab.add_flag(
+                reddit_username_check2)
+            if reddit_usernames == 'remove':
+                pattern = [{'ORTH': '/u'}, {'ORTH': '/'}, {'IS_ALPHA': True}, {'ORTH': {'REGEX': '\w{1,20}}'}}]
+                pattern2=[[{'ORTH': '/u'}, {'ORTH': '/'},
+                                      {'IS_ALPHA': True}],
+                                  [{'ORTH': 'u'}, {'ORTH': '/'},
+                                   {'IS_ALPHA': True}]]
+                self._matcher.add('REDDIT_USERNAME', [[{"TEXT": {"REGEX": "/u/\w{1,20}"}}],[{"TEXT": {"REGEX": "u/\w{1,20}"}}]], on_match=self._remove_token)
+                self._matcher.add('REDDIT_USERNAME', pattern2, on_match=self._remove_token)
+            else:
+                self._matcher.add('REDDIT_USERNAME', [[{"TEXT": {"REGEX": "u/\w{1,20}"}}],[{"TEXT": {"REGEX": "/u/\w{1,20}"}}]], on_match=self._replace_token)
+                self._replacements['REDDIT_USERNAME'] = reddit_usernames
+            #elif reddit_username_flag is True or reddit_username_flag2 is True:
+                #self._matcher.add('REDDIT_USERNAME', [[{"TEXT": {"REGEX": "u/\w{1,20}"}}],[{"TEXT": {"REGEX": "/u/\w{1,20}"}}]], on_match=self._replace_token)
+           
+            #self._matcher.add('REDDIT_USERNAME',  [[
+                #{reddit_username_flag: True}]], on_match=self._replace_token)
             self._replacements['REDDIT_USERNAME'] = reddit_usernames
+        
+        #ruler = self._nlp.add_pipe("entity_ruler")
+        #ruler.add_patterns(rule_patterns)
 
         if subreddits is not False:
             def subreddit_check(text):
                 return bool(SUBREDDITS_RE.fullmatch(text))
+            def subreddit_check2(text):
+                return bool(SUBREDDITS_RE2.fullmatch(text))
             subreddit_flag = self._nlp.vocab.add_flag(subreddit_check)
-            self._matcher.add('SUBREDDIT', self._replace_token,
-                              [{subreddit_flag: True}])
+            SUBREDDIT_FLAG = self._nlp.vocab.add_flag(subreddit_check)
+
+            subreddit_flag2 = self._nlp.vocab.add_flag(subreddit_check2)
+            #subFlagID1 = self._nlp.vocab.check_flag(subreddit_flag)
+            #subFlagID2 = text.check_flag(subreddit_flag2)
+            #print(subreddit_flag2.flag_id)
+            #print(subFlagID2)
+           
+            self._matcher.add('SUBREDDIT', [[{"TEXT": {"REGEX": "r/\w{1,20}"}}],[{"ORTH": {"REGEX": "/r/\w{1,20}"}}]], on_match=self._replace_token)
+            flag = 'FLAG' + str(subreddit_flag)
+            #Token.set_extension("FLAGG", getter=subreddit_check)
+            #self._matcher.add('SUBREDDIT', 
+                              #[[{'FLAGG': True}]], on_match=self._replace_token)
             self._replacements['SUBREDDIT'] = subreddits
 
         if twitter_handles is not False:
-            self._matcher.add('TWITTER_HANDLE', self._handles_postprocess,
-                              [{twitter_handle_flag: True}])
+            self._matcher.add('TWITTER_HANDLE', on_match=self._handles_postprocess)
+            #self._matcher.add('TWITTER_HANDLE', 
+                              #[[{twitter_handle_flag: True}]], on_match=self._handles_postprocess)
 
         if hashtags is not False:
-            self._matcher.add('HASHTAG', self._hashtag_postprocess, [
-                {hashtag_flag: True}])
+        
+            #self._matcher.add('HASHTAG', [[{'ORTH': '#\w{1,20}'}, {'IS_ASCII': True}, {'ORTH': {'REGEX': '\w{1,20}'}}]], on_match=self._hashtag_postprocess)
+            self._matcher.add('HASHTAG', [[{'TEXT': {'REGEX':'#\w{1,20}'}}]], on_match=self._hashtag_postprocess)
+            #self._matcher.add('HASHTAG', on_match=self._hashtag_postprocess)
+            #self._matcher.add('HASHTAG', [[
+                #{hashtag_flag: True}]], on_match=self._hashtag_postprocess)
 
         if hashtags == 'split' or twitter_handles == 'split':
             file = os.path.join(DATA_PATH, 'wordsfreq_wiki2.txt')
@@ -470,21 +524,24 @@ class CrazyTokenizer(object):
                 self._realnames = json.load(f)
 
         if ignore_quotes:
-            self._merging_matcher.add('QUOTE', None, [{'ORTH': '"'}, {
-                'OP': '*', 'IS_ASCII': True}, {'ORTH': '"'}])
+            self._merging_matcher.add('QUOTE', [[{'ORTH': '"'}, {
+                'OP': '*', 'IS_ASCII': True}, {'ORTH': '"'}]])
 
             def doublequote_check(text):
                 return bool(QUOTES_RE.fullmatch(text))
-            doublequote_flag = self._nlp.vocab.add_flag(doublequote_check)
-            self._matcher.add('DOUBLE_QUOTES', self._remove_token, [
-                {doublequote_flag: True}])
+            #doublequote_flag = self._nlp.vocab.add_flag(doublequote_check)
+            if doublequote_check is True:
+               
+           
+                self._matcher.add('DOUBLE_QUOTES', [[{'ORTH': '""'}, {
+                    'OP': '*', 'IS_ASCII': True}, {'ORTH': '""'}]], on_match=self._remove_token)
 
         if self._stopwords:
             def stopword_check(text):
                 return bool(text.lower() in self._stopwords)
             stopword_flag = self._nlp.vocab.add_flag(stopword_check)
-            self._matcher.add('STOPWORD', self._remove_token,
-                              [{stopword_flag: True}])
+            self._matcher.add('STOPWORD', 
+                              [[{'IS_STOP': True}]], on_match=self._remove_token)
 
         if keep_untokenized is not None:
             if not isinstance(keep_untokenized, list):
@@ -495,27 +552,27 @@ class CrazyTokenizer(object):
                 rule = []
                 for token in phrase_tokens:
                     rule.append({'LOWER': token.lower()})
-                self._merging_matcher.add('RULE_' + str(i), None, rule)
+                self._merging_matcher.add('RULE_' + str(i), [rule])
 
         if pos_emojis:
             if not isinstance(pos_emojis, list):
                 pos_emojis = POS_EMOJIS
             pos_patterns = [[{'ORTH': emoji}] for emoji in pos_emojis]
-            self._matcher.add('HAPPY', self._replace_token, *pos_patterns)
+            self._matcher.add('HAPPY', [*pos_patterns], on_match=self._replace_token)
             self._replacements['HAPPY'] = 'POS_EMOJI'
 
         if neg_emojis:
             if not isinstance(neg_emojis, list):
                 neg_emojis = NEG_EMOJIS
             neg_patterns = [[{'ORTH': emoji}] for emoji in neg_emojis]
-            self._matcher.add('SAD', self._replace_token, *neg_patterns)
+            self._matcher.add('SAD', [*neg_patterns], on_match=self._replace_token)
             self._replacements['SAD'] = 'NEG_EMOJI'
 
         if neutral_emojis:
             if not isinstance(neutral_emojis, list):
                 neutral_emojis = NEUTRAL_EMOJIS
             neutral_patterns = [[{'ORTH': emoji}] for emoji in neutral_emojis]
-            self._matcher.add('NEUTRAL', self._replace_token, *neutral_patterns)
+            self._matcher.add('NEUTRAL', [*neutral_patterns], on_match=self._replace_token)
             self._replacements['NEUTRAL'] = 'NEUTRAL_EMOJI'
 
         if isinstance(extra_patterns, list):
@@ -523,8 +580,8 @@ class CrazyTokenizer(object):
             for name, re_pattern, replacement_token in extra_patterns:
                 def flag(text): return bool(re_pattern.match(text))
                 self._flags[name] = self._nlp.vocab.add_flag(flag)
-                self._matcher.add(name, self._replace_token,
-                                  [{self._flags[name]: True}])
+                self._matcher.add(name, 
+                                  [[{self._flags[name]: True}]], on_match=self._replace_token)
                 self._replacements[name] = replacement_token
 
         if stem and ('nltk' in sys.modules):
@@ -539,15 +596,21 @@ class CrazyTokenizer(object):
                               [{'IS_ALPHA': True}])
 
         retokenize_flag = self._nlp.vocab.add_flag(retokenize_check)
-        self._matcher.add('RETOKENIZE', self._retokenize,
-                          [{retokenize_flag: True, 'IS_PUNCT': False,
+        if retokenize_flag == False and hashtag_flag == False and twitter_handle_flag == False:
+            self._matcher.add('RETOKENIZE', 
+                          [[{'IS_PUNCT': False,
                             'LIKE_URL': False, 'LIKE_EMAIL': False,
-                            'LIKE_NUM': False, hashtag_flag: False,
-                            twitter_handle_flag: False}])
-
-        self._nlp.add_pipe(self._merge_doc, name='merge_doc', last=True)
-        self._nlp.add_pipe(self._match_doc, name='match_doc', last=True)
-        self._nlp.add_pipe(self._postproc_doc, name='postproc_doc', last=True)
+                            'LIKE_NUM': False}]], on_match=self._retokenize)
+        
+        
+#retokenize_flag: True
+   
+        #self._nlp.add_pipe('merge_doc', last=True)
+        #self._nlp.add_pipe('match_doc', last=True)
+        #self._nlp.add_pipe('postproc_doc', last=True)
+        #self._nlp.add_pipe(self._merge_doc, name='merge_doc', last=True)
+        #self._nlp.add_pipe(self._match_doc, name='match_doc', last=True)
+        #self._nlp.add_pipe(self._postproc_doc, name='postproc_doc', last=True)
 
     @staticmethod
     def _lowercase(__, doc, i, matches):
@@ -622,8 +685,10 @@ class CrazyTokenizer(object):
     @staticmethod
     def _remove_token(__, doc, i, matches):
         # Remove tokens
+
         __, start, end = matches[i]
         span = doc[start:end]
+        #print(span)
         for tok in span:
             tok._.transformed_text = ''
 
@@ -741,25 +806,53 @@ class CrazyTokenizer(object):
         text = re.sub(r'\s{2,}', ' ', text)
 
         return text.strip()
-
+    
+    #@Language.component("merge_doc")
     def _merge_doc(self, doc):
         # Perform merging for certain types of tokens
-        matches = self._merging_matcher(doc)
+        matches = self._merging_matcher(doc)#, as_spans=True)
+        #for span in matches:
+         #   print(span)
         spans = []
+        newSpan =[]
+        #print(len(matches))
         for __, start, end in matches:
-            spans.append(doc[start:end])
-        for span in spans:
-            span.merge()
+            #print(len(doc))
+            #print(end)
+            #spans.append(doc[doc[start].left_edge.i : doc[end].right_edge.i-1] )
+     
+            newSpan.insert(0, [start, end])
+        #print(spans)
+        for span in newSpan:
+            with doc.retokenize() as retokenizer:
+                retokenizer.merge(doc[span[0]:span[1]])
+
+        '''for span in spans:
+        #for span in matches:
+            print(span.label)
+            print(len(span))
+            attrs = {'LEMMA': span.text}
+            with doc.retokenize() as retokenizer:
+                 retokenizer.merge(span, attrs=attrs)
+            #span.merge()'''
         for tok in doc:
             tok._.transformed_text = tok.text
 
         return doc
+    #@Language.component("my_component1", func=_merge_doc)
 
+    
+    
+    #@Language.component("match_doc")
+   
     def _match_doc(self, doc):
         # Perform all additional processing
         self._matcher(doc)
         return doc
+    #@Language.component("my_component2", func=_match_doc)
 
+   
+    #@Language.component("postproc_doc")
     def _postproc_doc(self, doc):
         # Perform postprocessing
         doc._.tokens = []
@@ -772,6 +865,8 @@ class CrazyTokenizer(object):
                         tok._.transformed_text.split())
                 doc._.tokens.append(tok._.transformed_text.strip())
         return doc
+    #@Language.component("my_component3", func=_postproc_doc)
+
 
     def tokenize(self, text):
         """
@@ -797,8 +892,18 @@ class CrazyTokenizer(object):
         if not isinstance(text, str):
             warnings.warn('Document {} is not a string'.format(text))
             return []
+        
         text = self._preprocess_text(text)
+        #print(text)
         doc = self._nlp(text)
+        doc = self._merge_doc(doc)
+        doc = self._match_doc(doc)
+        doc = self._postproc_doc(doc)
+        #doc1 = self._nlp.make_doc(text)  # Create a Doc from raw text
+       
+            #doc1 = self.proc(doc=doc1)  
+        #nlp = self._nlp(text)
+        #doc1 = self._nlp(doc1)
         tokens = doc._.tokens
         if self.params['ngrams'] > 1:
             if self.params['whitespaces_to_underscores']:
